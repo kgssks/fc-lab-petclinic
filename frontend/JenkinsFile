@@ -3,26 +3,29 @@ pipeline {
 
     environment {
         // =================================================================
-        // [수정 필요] 경로를 반드시 확인 후 변경하세요!
+        // [설정] 파일 경로 변수는 이제 필요 없습니다!
         // =================================================================
-        // 예: 리포지토리 구조가 app/front-web/Dockerfile 이라면 "app/front-web" 입력
         PROJECT_DIR    = "frontend"
 
-        TASK_JSON_FILE = "task-front-def.json"
-
-        // 프로젝트 설정
+        // 프로젝트 및 AWS 환경 설정
         GIT_REPO       = "https://github.com/kgssks/fc-lab-petclinic.git"
         REGION         = "ap-northeast-2"
+
+        // ECR 설정
         ECR_REPO_URI   = "471112978667.dkr.ecr.ap-northeast-2.amazonaws.com"
         ECR_NAME       = "fc-front"
+
+        // ECS 설정
         ECS_CLUSTER    = "final-cluster"
         ECS_SERVICE    = "task-front-def-service"
+
+        // [중요] AWS에 등록된 Task Definition의 패밀리 이름 (Family Name)
+        // AWS 콘솔 > ECS > Task Definitions 에서 확인 가능
         ECS_TASK_FAMILY = "task-front-def"
 
         // 권한 설정
         AWS_CREDENTIALS = "aws-credentials-cicd"
         IAM_ROLE_ARN    = "arn:aws:iam::471112978667:role/ecr-upload-role"
-        SLACK_CHANNEL   = "fc-cicd-study"
     }
 
     stages {
@@ -36,10 +39,6 @@ pipeline {
         stage('Build & Push to ECR') {
             steps {
                 script {
-                    // 디버깅: 실제로 이동하기 전에 파일이 있는지 확인
-                    sh "echo Checking directory: ${PROJECT_DIR}"
-                    sh "ls -F ${PROJECT_DIR}"
-
                     dir("${PROJECT_DIR}") {
                         try {
                             withAWS(region: "${REGION}", credentials: "${AWS_CREDENTIALS}", role: "${IAM_ROLE_ARN}", roleAccount: "developer", externalId: 'externalId') {
@@ -48,14 +47,13 @@ pipeline {
                                 sh "aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_REPO_URI}"
 
                                 echo "--- Building Docker Image ---"
-                                // Dockerfile이 현재 폴더(.)에 있어야 함
                                 sh "docker build -t ${ECR_NAME} ."
 
                                 echo "--- Pushing Image to ECR ---"
                                 sh "docker tag ${ECR_NAME}:latest ${ECR_REPO_URI}/${ECR_NAME}:${BUILD_NUMBER}"
                                 sh "docker push ${ECR_REPO_URI}/${ECR_NAME}:${BUILD_NUMBER}"
 
-                                // latest 태그 갱신
+                                // latest 태그도 갱신 (선택사항)
                                 sh "docker tag ${ECR_NAME}:latest ${ECR_REPO_URI}/${ECR_NAME}:latest"
                                 sh "docker push ${ECR_REPO_URI}/${ECR_NAME}:latest"
 
@@ -63,7 +61,7 @@ pipeline {
                                 sh "docker rmi ${ECR_REPO_URI}/${ECR_NAME}:latest"
                             }
                         } catch (error) {
-                            echo "Build Failed. Check if Dockerfile exists in ${PROJECT_DIR}"
+                            echo "Build Failed: ${error}"
                             currentBuild.result = 'FAILURE'
                             throw error
                         }
@@ -72,23 +70,61 @@ pipeline {
             }
         }
 
+
         stage('Deploy to ECS') {
             steps {
                 script {
-                    dir("${PROJECT_DIR}") {
+                    dir("${PROJECT_DIR}") { // 디렉토리 위치 확인
                         try {
                             withAWS(region: "${REGION}", credentials: "${AWS_CREDENTIALS}", role: "${IAM_ROLE_ARN}", roleAccount: "developer", externalId: 'externalId') {
 
-                                echo "--- Updating Task Definition ---"
-                                // JSON 파일 내의 태그 교체 (:latest -> :BUILD_NUMBER)
-                                sh "sed -i 's|${ECR_NAME}:latest|${ECR_NAME}:${BUILD_NUMBER}|g' ${TASK_JSON_FILE}"
-                                // 혹시 :0 으로 되어있을 경우를 대비해 추가
-                                sh "sed -i 's|${ECR_NAME}:0|${ECR_NAME}:${BUILD_NUMBER}|g' ${TASK_JSON_FILE}"
+                                echo "--- 1. Fetch Current Task Definition ---"
+                                // AWS에서 현재 설정을 가져와 파일로 저장
+                                sh "aws ecs describe-task-definition --task-definition ${ECS_TASK_FAMILY} --region ${REGION} > current_task_def.json"
 
-                                echo "--- Registering Task Definition ---"
-                                def task_rev = sh(script: "aws ecs register-task-definition --cli-input-json file://${TASK_JSON_FILE} --region ${REGION} | jq --raw-output .taskDefinition.revision", returnStdout: true).trim()
+                                echo "--- 2. Modify JSON using Groovy (Safe Mode) ---"
 
-                                echo "--- Updating Service ---"
+                                // 파일 읽기
+                                def currentJson = readFile(file: 'current_task_def.json')
+
+                                // [핵심 수정] JsonSlurper -> JsonSlurperClassic 으로 변경 (직렬화 오류 해결)
+                                def data = new groovy.json.JsonSlurperClassic().parseText(currentJson)
+
+                                // taskDefinition 키가 있으면 그 안으로 진입, 없으면 그대로 사용
+                                def taskDef = data.taskDefinition ? data.taskDefinition : data
+
+                                // 불필요한 필드 제거
+                                def keysToRemove = ['taskDefinitionArn', 'revision', 'status', 'requiresAttributes', 'compatibilities', 'registeredAt', 'registeredBy']
+                                keysToRemove.each { key ->
+                                    taskDef.remove(key)
+                                }
+
+                                // 이미지 태그 업데이트
+                                def newImage = "${ECR_REPO_URI}/${ECR_NAME}:${BUILD_NUMBER}"
+                                taskDef.containerDefinitions.each { container ->
+                                    if (container.image.contains(ECR_REPO_URI)) {
+                                        container.image = newImage
+                                        echo "Updated container '${container.name}' image to: ${newImage}"
+                                    }
+                                }
+
+                                // 수정된 내용을 파일로 저장
+                                def newJsonString = groovy.json.JsonOutput.toJson(taskDef)
+                                writeFile(file: 'new_task_def.json', text: newJsonString)
+
+                                echo "--- 3. Register New Task Definition ---"
+
+                                // 등록 수행 및 결과 저장
+                                sh "aws ecs register-task-definition --cli-input-json file://new_task_def.json --region ${REGION} > register_result.json"
+
+                                // [핵심 수정] 결과 읽기에서도 JsonSlurperClassic 사용
+                                def registerResult = readFile(file: 'register_result.json')
+                                def resultData = new groovy.json.JsonSlurperClassic().parseText(registerResult)
+                                def task_rev = resultData.taskDefinition.revision
+
+                                echo "NEW REVISION: ${task_rev}"
+
+                                echo "--- 4. Update Service ---"
                                 sh """
                                     aws ecs update-service \
                                     --cluster ${ECS_CLUSTER} \
@@ -111,18 +147,15 @@ pipeline {
 
     post {
         success {
-            // Slack 설정 단순화 (시스템 설정 사용)
             slackSend (
-                channel: "${SLACK_CHANNEL}",
                 color: '#00FF00',
                 message: "SUCCESS: ${env.JOB_NAME} [${env.BUILD_NUMBER}] Deployed"
             )
         }
         failure {
             slackSend (
-                channel: "${SLACK_CHANNEL}",
                 color: '#FF0000',
-                message: "FAIL: ${env.JOB_NAME} [${env.BUILD_NUMBER}] Check Jenkins Logs"
+                message: "FAIL: ${env.JOB_NAME} [${env.BUILD_NUMBER}] Check Logs"
             )
         }
     }
